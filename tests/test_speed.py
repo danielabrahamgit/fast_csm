@@ -1,3 +1,4 @@
+import gc
 import numpy as np
 import sigpy as sp
 import sigpy.mri as mri
@@ -12,8 +13,6 @@ import matplotlib.pyplot as plt
 from mr_recon.utils.func import np_to_torch, torch_to_np
 from fast_csm.train_kernels import train_kernels, gen_source_vectors_rot
 from fast_csm.extract_mps import csm_from_kernels, csm_from_espirit
-from sigpy.mri.app import EspiritCalib
-from mr_sim.trj_lib import trj_lib
 from mr_recon.utils.func import normalize, calc_coil_subspace, fourier_resize
 
 # Set seed
@@ -22,7 +21,7 @@ torch.manual_seed(100)
 
 # GPU/CPU
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-device_idx = -1
+device_idx = 6
 try:
     torch_dev = torch.device(device_idx)
 except:
@@ -32,7 +31,7 @@ except:
 ndim = 2
 im_size = (220,) * ndim
 n_coil = 12
-calib_size = (128,) * ndim
+calib_size = (32,) * ndim
 coil_compress = False
 sigma = 5e-3 * 0
 
@@ -44,15 +43,30 @@ if coil_compress:
     sub, ksp_cal, mps = calc_coil_subspace(ksp_cal, n_coil, ksp_cal, mps)
 ksp_cal_noisy = ksp_cal + np.random.normal(0, sigma, ksp_cal.shape) + 1j * np.random.normal(0, sigma, ksp_cal.shape)
 
+# Optional spatial downsampling similar to PISCO
+M = 1
+im_size_lowres = tuple([im_size[i] // M for i in range(ndim)])
+
 # Show shapes
 print(f'ksp_cal shape = {ksp_cal.shape}')
 print(f'mps shape = {mps.shape}')
 
-# Implicit estimation
-M = 1
-im_size_lowres = [im_size[i] // M for i in range(ndim)]
+# Estimate maps via ESPRIT
+start = time.perf_counter()
+mps_esp, vals_esp = csm_from_espirit(np_to_torch(ksp_cal).to(torch_dev), im_size_lowres, crp=0.0)
+end = time.perf_counter()
+mps_esp = mps_esp.cpu()
+vals_esp = vals_esp.cpu()
+esp_time = end - start
+
+# Clear GPU mem
+gc.collect()
+with torch.cuda.device(device_idx):
+    torch.cuda.empty_cache()
+
+# GRAPPA based estimation
 img_cal = sp.ifft(ksp_cal_noisy, axes=range(-ndim, 0))
-source_vecs = gen_source_vectors_rot(num_kerns=10,
+source_vecs = gen_source_vectors_rot(num_kerns=20,
                                      num_inputs=5,
                                      ndim=ndim,
                                      ofs=0.15,
@@ -61,34 +75,16 @@ source_vecs = np_to_torch(source_vecs).to(torch_dev)
 img_cal = np_to_torch(img_cal).to(torch_dev)
 start = time.perf_counter()
 grappa_kernels = train_kernels(img_cal, source_vecs, 
-                               lamda_tikonov=1e0,
-                            #    lamda_tikonov=1e2,
+                               lamda_tikonov=1e1,
                                solver='lstsq_torch', 
                                fast_method=True,)
 mps_impl, vals_impl = csm_from_kernels(grappa_kernels, source_vecs, im_size_lowres, 
                                        crp=0.0,
                                        verbose=True)
-# mps_impl, vals_impl = csm_from_espirit(np_to_torch(ksp_cal).to(torch_dev), im_size, crp=0.0)
 end = time.perf_counter()
 mps_impl = mps_impl.cpu()
 vals_impl = vals_impl.cpu()
 impl_time = end - start
-
-# Estimate maps via ESPRIT
-print()
-start = time.perf_counter()
-mps_esp, vals_esp = csm_from_espirit(np_to_torch(ksp_cal).to(torch_dev), im_size, crp=0.0)
-# mps_esp, vals_esp = EspiritCalib(sp.resize(ksp_cal, (n_coil, *im_size_lowres)), 
-#                                  calib_width=calib_size[0], 
-#                                  crop=0.0,
-#                                  device=sp.Device(device_idx),
-#                                  output_eigenvalue=True).run()
-end = time.perf_counter()
-# mps_esp = fourier_resize(mps_esp, im_size)
-# vals_esp = fourier_resize(vals_esp, im_size)
-# mps_esp = sp.to_device(mps_esp) * M
-# vals_esp = sp.to_device(vals_esp)[0] * M
-esp_time = end - start
 
 # Times
 print(f'ESPIRIT time = {esp_time:.3f}s')
